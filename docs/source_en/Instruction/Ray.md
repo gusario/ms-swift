@@ -64,6 +64,22 @@ rollout:
   gpus: 4    # dedicated 4 GPUs
 ```
 
+### GRPO Input Preparation
+
+For DP sizes above 8 with complete per-rank micro-batches, GRPO sends contiguous raw sample shards to the training
+workers. One existing collector per DP shard runs the native CPU encoder and collator; TP/PP/CP peers reuse the
+same prepared tensors through Ray object references. No model forward or reward calculation moves into preparation.
+
+The driver retains global reward/advantage calculation and combines global token counts. Each scoring or training
+call resolves fresh input dictionaries and attaches the latest GRPO metadata, including scores and advantages.
+Small-DP runs, partial micro-batch shards and custom encoder/collator overrides retain driver preparation.
+`encode_rollout_batch` keeps its existing eager-encoding behavior for direct callers.
+
+Inputs and media must be accessible on the training nodes. Encoders should be safe for concurrent CPU calls;
+parallel encoding can change random-number consumption for stochastic templates. Encoder thread limits are scoped
+to preparation and restored after errors. Prepared tensors remain in the object store while the driver holds their
+references; this does not cache optimizer state, model activations or scoring results.
+
 ### GKD Teacher Modes
 
 | Mode | Configuration | top-k | full-vocab |

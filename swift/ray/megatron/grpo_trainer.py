@@ -25,6 +25,7 @@ from swift.rollout import MultiTurnScheduler, invoke_async_hook, multi_turns, ru
 from swift.utils import get_logger, remove_response
 from .base_trainer import BaseRayTrainer
 from .driver_utils import extract_iteration
+from .worker_group import DPDispatchedDict
 
 logger = get_logger()
 
@@ -194,9 +195,8 @@ class GRPOTrainer(BaseRayTrainer):
                 chunk_start = step_idx * chunk_size
                 chunk_end = chunk_start + chunk_size
                 chunk_rollout = rollout_with_outputs[chunk_start:chunk_end]
-                chunk_samples = self.encode_rollout_batch(chunk_rollout)
-
-                dispatch, grpo_batches = self._collate_for_workers(tg, chunk_samples)
+                chunk_samples = chunk_rollout
+                dispatch, grpo_batches = self._prepare_rollout_batch(tg, chunk_samples)
                 logps_rows = tg.compute_logps(dispatch)
                 self._scatter_logps(grpo_batches, logps_rows, 'old_per_token_logps')
                 if self.beta != 0.0:
@@ -230,6 +230,32 @@ class GRPOTrainer(BaseRayTrainer):
                 iteration = extract_iteration(results)
 
         return iteration
+
+    def _prepare_rollout_batch(self, tg, samples: List[GRPOSample], **collate_kwargs):
+        if (samples and tg.dp_size > 8 and len(samples) % (tg.dp_size * int(self.args.micro_batch_size)) == 0
+                and getattr(self.encode_rollout_batch, '__func__', None) is GRPOTrainer.encode_rollout_batch
+                and getattr(self._collate_for_workers, '__func__', None) is BaseRayTrainer._collate_for_workers):
+            return self._prepare_rollout_on_workers(tg, samples, **collate_kwargs)
+        # Teacher consumers must see the sample objects returned by a custom encoder.
+        samples[:] = self.encode_rollout_batch(samples)
+        return self._collate_for_workers(tg, samples, **collate_kwargs)
+
+    def _prepare_rollout_on_workers(self, tg, samples: List[GRPOSample], **collate_kwargs):
+        dp_size = tg.dp_size
+        for sample in samples:
+            sample.encoded = None
+        shard_size = len(samples) // dp_size
+        shards = DPDispatchedDict({rank: samples[rank * shard_size:(rank + 1) * shard_size] for rank in range(dp_size)})
+        prepared = tg.prepare_rollout_batch(shards, padding_to=self._padding_to, **collate_kwargs)
+        if set(prepared) != set(range(dp_size)):
+            raise RuntimeError('Rollout preparation did not return every DP collector')
+        dispatch = DPDispatchedDict(prepared)
+        batches = [batch.grpo_batch for rank in range(dp_size) for batch in dispatch[rank]]
+        if any(batch.num_items_in_batch is not None for batch in batches):
+            count = sum(batch.completion_mask.sum() for batch in batches)
+            for batch in batches:
+                batch.num_items_in_batch = count
+        return dispatch, batches
 
     def _compute_teacher_logps(self, tg, chunk_samples: List[GRPOSample], dispatch,
                                grpo_batches: List[GRPOBatch]) -> None:

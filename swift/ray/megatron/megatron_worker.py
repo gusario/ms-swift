@@ -4,12 +4,14 @@ from __future__ import annotations
 import inspect
 import os
 import torch
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from swift.rl_core.data import GRPOBatch
+from swift.rl_core.data import GRPOBatch, GRPOSample
 from swift.utils import gc_collect, get_current_device, get_logger
 from .checkpoint_engine import CheckpointEngineMixin
+from .data import PreparedBatch, collate_rollout_batch, resolve_batches
 from .worker_group import dispatch_collect
 
 if TYPE_CHECKING:
@@ -18,10 +20,10 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 # --- worker-side data-flow types ------------------------------------------
-# Since collation moved to the driver, the worker consumes already-collated
-# micro-batches and returns per-sample logps:
+# Workers consume collated CPU micro-batches, directly or via PreparedBatch
+# object references, and return per-sample logps:
 #
-# ModelInputs: a collated micro-batch (driver-side ``collate_to_grpo_micro_batch``)
+# ModelInputs: a CPU micro-batch from the shared ``collate_to_grpo_micro_batch``
 #   fed to ``model(**model_inputs)``. Carries the model-forward tensors plus
 #   ``grpo_batch`` (GRPOBatch) and optional ``teacher_output`` / ``teacher_model_inputs``
 #   / ``data_source``.
@@ -132,6 +134,7 @@ class MegatronWorker(CheckpointEngineMixin):
         own sequence shard, so the cache is already the correct local slice. ``train_step``
         attaches it to the matching micro-batch (same dispatch dict ⇒ same order).
         """
+        micro_batches = resolve_batches(micro_batches)
         teacher_inputs = [mi['teacher_model_inputs'] for mi in micro_batches]
         if getattr(self._args, '_teacher_use_disable_adapter', False):
             # Self-distillation (LoRA): teacher = student base model with the LoRA adapter
@@ -149,6 +152,39 @@ class MegatronWorker(CheckpointEngineMixin):
                 self._cached_teacher_logits = self._loss_fn.compute_teacher_logits(self.teacher.models[0],
                                                                                    teacher_inputs, self._args)
         gc_collect()
+
+    @dispatch_collect(dispatch='dp', collect='dp')
+    def prepare_rollout_batch(self,
+                              samples: List[GRPOSample],
+                              padding_to: Optional[int] = None,
+                              **collate_kwargs) -> Optional[List[PreparedBatch]]:
+        import ray
+
+        from swift.rlhf_trainers.utils import encode_sample
+
+        if not self.get_parallel_info()['is_collector']:
+            return None
+        template = self._pipeline.template
+        missing = [sample for sample in samples if sample.encoded is None]
+        threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            if missing:
+                with ThreadPoolExecutor(max_workers=min(4, len(missing))) as pool:
+                    for sample, encoded in zip(missing, pool.map(lambda sample: encode_sample(sample, template),
+                                                                 missing)):
+                        encoded.pop('_extra_kwargs', None)
+                        sample.encoded = encoded
+            dispatch, _ = collate_rollout_batch(samples, self._args, template, 1, torch.device('cpu'), padding_to,
+                                                **collate_kwargs)
+            return [
+                PreparedBatch(ray.put({
+                    k: v
+                    for k, v in inputs.items() if k != 'grpo_batch'
+                }), inputs['grpo_batch']) for inputs in dispatch[0]
+            ]
+        finally:
+            torch.set_num_threads(threads)
 
     def get_parallel_info(self) -> Dict[str, Any]:
         from megatron.core import mpu
@@ -195,6 +231,7 @@ class MegatronWorker(CheckpointEngineMixin):
         args = megatron.args
         assert isinstance(micro_batches, list), \
             f'train_step expects List[ModelInputs], got {type(micro_batches).__name__}'
+        micro_batches = resolve_batches(micro_batches)
         self._inject_extra_metrics(extra_metrics)
         # GKD colocated teacher: attach the per-micro-batch TeacherOutput cached by
         # compute_teacher_logits (worker-local, already CP-correct), aligned by order.
@@ -204,7 +241,7 @@ class MegatronWorker(CheckpointEngineMixin):
                 if t_out is not None:
                     mi['teacher_output'] = t_out
             self._cached_teacher_logits = None
-        # Driver-side collate produces CPU tensors; move each micro-batch to the GPU.
+        # Collation produces CPU tensors; move each micro-batch to the GPU.
         device = get_current_device()
         moved: List[ModelInputs] = []
         for mi in micro_batches:
@@ -291,7 +328,7 @@ class MegatronWorker(CheckpointEngineMixin):
     def compute_logps(self, micro_batches: List[ModelInputs]) -> List[LogpsRow]:
         """Compute per-token logps under the current policy model.
 
-        Receives this dp_rank's collated micro-batches (driver-side collate, CPU)
+        Receives this dp_rank's CPU micro-batches or prepared object references
         and runs the rank-local forward; returns one row per sample.
         """
         model = self._megatron.unwrapped_models[0]
@@ -333,6 +370,7 @@ class MegatronWorker(CheckpointEngineMixin):
         output_key: str,
     ) -> List[LogpsRow]:
         from swift.utils import to_device
+        micro_batches = resolve_batches(micro_batches)
         device = get_current_device()
         rows: List[LogpsRow] = []
         for model_inputs in micro_batches:

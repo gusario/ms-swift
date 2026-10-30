@@ -166,39 +166,10 @@ class BaseRayTrainer:
         objects referenced inside the dispatch dict, so the caller fills old/ref logps +
         advantages on them and they reach ``train_step`` via the dispatch dict.
         """
-        from swift.rlhf_trainers.utils import collate_to_grpo_micro_batch
+        from .data import collate_rollout_batch
 
-        dp_size = tg.dp_size
-        mbs = int(self.args.micro_batch_size)
-        n = len(samples)
-        if n % dp_size != 0:
-            raise ValueError(f'_collate_for_workers: batch size {n} not divisible by dp_size {dp_size}.')
-        shard_size = n // dp_size
-
-        dispatch = DPDispatchedDict()
-        flat_grpo_batches: List['GRPOBatch'] = []
-        for dp_rank in range(dp_size):
-            shard = samples[dp_rank * shard_size:(dp_rank + 1) * shard_size]
-            micro_batches = []
-            for i in range(0, len(shard), mbs):
-                chunk = shard[i:i + mbs]
-                model_inputs, grpo_batch = collate_to_grpo_micro_batch(
-                    chunk,
-                    self.template,
-                    device=self.device,
-                    padding_to=self._padding_to,
-                    router_replay_mode=getattr(self.args, 'router_replay_mode', 'disabled'),
-                    **collate_kwargs,
-                )
-                model_inputs['grpo_batch'] = grpo_batch
-                micro_batches.append(model_inputs)
-                flat_grpo_batches.append(grpo_batch)
-            dispatch[dp_rank] = micro_batches
-        if getattr(self.args, 'loss_type', None) in ['bnpo', 'cispo', 'dapo', 'fipo']:
-            num_items_in_batch = sum(grpo_batch.completion_mask.sum().item() for grpo_batch in flat_grpo_batches)
-            for grpo_batch in flat_grpo_batches:
-                grpo_batch.num_items_in_batch = num_items_in_batch
-        return dispatch, flat_grpo_batches
+        return collate_rollout_batch(samples, self.args, self.template, tg.dp_size, self.device, self._padding_to,
+                                     **collate_kwargs)
 
     def _prepare_state(self) -> None:
         """Shared ``_prepare_state`` prefix for all Ray trainers.

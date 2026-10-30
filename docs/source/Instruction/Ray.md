@@ -64,6 +64,20 @@ rollout:
   gpus: 4    # 独立的 4 张卡
 ```
 
+### GRPO 输入准备
+
+当 DP 大于 8 且每个 rank 的分片包含完整 micro-batch 时，GRPO 将连续的原始样本分片发送到训练 worker。
+每个 DP 分片仅由已有的一个 collector 调用原生 CPU 编码器和 collator；TP/PP/CP 同伴通过 Ray 对象引用复用
+同一份输入 Tensor。准备过程不执行模型前向，也不迁移奖励计算。
+
+driver 仍负责全局奖励、优势及 token 归一化计数。每次打分或训练调用都会解析新的输入字典，并附加最新的
+GRPO 元数据，包括分数和优势。小 DP、包含不完整 micro-batch 的分片，以及自定义编码器或 collator 的覆盖
+实现仍使用 driver 准备路径。直接调用 `encode_rollout_batch` 时仍保留原有的即时编码行为。
+
+训练节点必须能够访问输入及媒体。编码器应支持并发 CPU 调用；随机模板的并行编码可能改变随机数的消耗。
+编码线程限制仅在准备期间生效，异常后也会恢复。只要 driver 持有引用，准备的 Tensor 就保留在对象存储中；
+这里不缓存优化器状态、模型激活或打分结果。
+
 ### GKD Teacher 模式
 
 | 模式 | 配置方式 | top-k | full-vocab |
